@@ -1,316 +1,434 @@
 import streamlit as st
-import pymupdf  # PyMuPDF
-from linkedin_api.linkedin import Linkedin
 import google.generativeai as genai
-import os
-from dotenv import load_dotenv
-
-# --- Load .env file for local development ---
-load_dotenv()
+from linkedin_api import Linkedin  # For Linkedin Scraper
+import pymupdf  # For PDF parsing (fitz)
+import re  # For cleaning up LinkedIn profile ID
 
 
-# --- Your Original Helper Functions (with minimal necessary changes from previous version) ---
+# --- LinkedIn Scraper Function (modified slightly for clarity) ---
+def convert_linkedin_url_to_id(profile_url: str) -> str:
+    """
+    Extracts the public profile ID from a LinkedIn URL.
+    Handles common URL formats like:
+    - https://www.linkedin.com/in/username/
+    - https://www.linkedin.com/in/username
+    - www.linkedin.com/in/username
+    """
+    if not profile_url:
+        return ""
+    # Remove protocol and www if present
+    profile_url = re.sub(r"^(https?://)?(www\.)?linkedin\.com/in/", "", profile_url)
+    # Remove trailing slash if present
+    if profile_url.endswith('/'):
+        profile_url = profile_url[:-1]
+    return profile_url
 
-def linkedin_scrapper(user_email: str, user_password: str, profile_url: str) -> list | str:
+
+def linkedin_scrapper(user_email: str, user_password: str, profile_url: str) -> tuple[str, list | str]:
+    """
+    Scrapes LinkedIn profile data.
+    Returns a tuple: (status_message, data_or_error_string)
+    """
     temp = []
+    api = None  # Initialize api to None
     try:
-        api = Linkedin(user_email, user_password, refresh_cookies=False)
+        st.write("Attempting to log in to LinkedIn...")
+        api = Linkedin(user_email, user_password, refresh_cookies=True)  # Added refresh_cookies
+        st.write("LinkedIn login successful.")
     except Exception as e:
-        return f"Incorrect Credentials or LinkedIn API issue: {e}"
+        st.error(f"LinkedIn Login Error: {e}")
+        return "Incorrect Credentials or Login Issue", f"Error: {e}"
+
+    if not api:  # Check if api object was successfully created
+        return "LinkedIn API not initialized", "Error: API object is None."
 
     try:
-        if "/in/" in profile_url:
-            user_profile_id = profile_url.split("/in/")[1].split("/")[0].split("?")[0]
-        else:
-            user_profile_id = profile_url.split(r"/")[-1].split("?")[0]
-
+        user_profile_id = convert_linkedin_url_to_id(profile_url)
         if not user_profile_id:
-            return "Could not extract a valid profile ID from the URL."
+            return "Invalid Profile URL", "Error: Could not extract profile ID from URL."
 
-        profile_data = api.get_profile(user_profile_id)
+        st.write(f"Fetching profile for ID: {user_profile_id}...")
+        profile_data = api.get_profile(user_profile_id)  # Use the extracted ID
+
+        if not profile_data:  # Check if profile_data is None or empty
+            return "Profile does not exist or is private", "Error: No data returned for profile."
+
+        # It's safer to check if keys exist before accessing
+        # And to convert items to a list of tuples only if it's a dict
+        if isinstance(profile_data, dict):
+            profile_items = list(profile_data.items())  # This was the original intent
+        else:
+            st.warning("Profile data is not in the expected dictionary format. Raw data:")
+            st.json(profile_data)  # Show what was received
+            return "Unexpected Profile Data Format", "Error: Profile data is not a dictionary."
+
+        # The original indexing is very fragile.
+        # It assumes a fixed order and length of profile_items.
+        # A better approach would be to get items by their actual keys.
+        # For example: profile_data.get('headline'), profile_data.get('summary')
+        # However, sticking to the provided logic for now:
+
+        # Safety checks for indices
+        data_map = {
+            "headline": profile_data.get('headline', 'N/A'),
+            "summary": profile_data.get('summary', 'N/A'),  # 'summary' is more common than 'about'
+            "skills": [skill.get('name', 'N/A') for skill in profile_data.get('skills', [])],
+            # Skills are usually a list of dicts
+            "certifications": profile_data.get('certifications', []),  # Assuming this key exists
+            # "experiences": profile_data.get('experience', []), # Example for experiences
+            # "education": profile_data.get('education', [])   # Example for education
+        }
+        # Let's try to get the requested data using dictionary keys where possible
+        temp.append(("headline", data_map["headline"]))
+        temp.append(("summary", data_map["summary"]))  # 'about' might be 'summary'
+        temp.append(("skills", data_map["skills"]))
+        temp.append(("certifications", data_map["certifications"]))
+
+        # Fallback to original indexing if direct key access fails or for very specific items
+        # This section is very risky and likely to break.
+        # It assumes the original structure based on list(profile_data.items())
+        # Example: if you knew headline was always the first item:
+        # if len(profile_items) > 0: temp.append(profile_items[0]) # headline
+        # if len(profile_items) > 16: temp.append(profile_items[16]) # about (highly unlikely to be stable)
+        # if len(profile_items) > 34: temp.append(profile_items[34]) # skills
+        # if len(profile_items) > 30: temp.append(profile_items[30]) # certifications
+
+        st.write("LinkedIn data fetched successfully.")
+        return "Success", temp
+
     except Exception as e:
-        return f"Error fetching profile (ID: {user_profile_id if 'user_profile_id' in locals() else 'unknown'}): {e}"
-
-    if not profile_data:
-        return "Profile does not exist or could not be fetched (empty response)."
-
-    profile_data_items = list(profile_data.items())
-
-    if len(profile_data_items) == 0:
-        return "Profile data is empty after fetching."
-
-    try:
-        # These indices are fragile examples.
-        temp.append(profile_data_items[0])
-        if len(profile_data_items) > 16: temp.append(profile_data_items[16])
-        if len(profile_data_items) > 34: temp.append(profile_data_items[34])
-        if len(profile_data_items) > 30: temp.append(profile_data_items[30])
-    except IndexError:
-        return f"Error accessing profile data by index. API response structure may have changed. Data items count: {len(profile_data_items)}"
-
-    if not temp:
-        return "No specific data points could be extracted by index."
-    return temp
+        st.error(f"Error fetching LinkedIn profile data: {e}")
+        return "Scraping Error", f"Error: {e}"
 
 
+# --- CV Text Extraction Function ---
 def extract_text_from_cv(uploaded_file) -> str | None:
+    if uploaded_file is None:
+        return None
     try:
+        # Read uploaded file as BytesIO
         doc = pymupdf.open(stream=uploaded_file.read(), filetype="pdf")
-        full_text = [page.get_text("text") for page in doc]
+        full_text = []
+        for page_num in range(doc.page_count):
+            page = doc.load_page(page_num)
+            page_text = page.get_text("text")
+            full_text.append(page_text)
         doc.close()
         return "\n".join(full_text)
     except Exception as e:
+        st.error(f"Error reading PDF: {e}")
         return f"Error reading PDF: {e}"
 
 
-def format_linkedin_data_for_prompt(linkedin_profile_data: list | str) -> str:
-    if isinstance(linkedin_profile_data, str):
-        return f"LinkedIn data not available: {linkedin_profile_data}"
-    elif isinstance(linkedin_profile_data, list):
-        linkedin_items_str = []
-        for key, value in linkedin_profile_data:
-            # Basic formatting for the list of tuples
-            item_str = f"{key}: "
-            if isinstance(value, dict) and 'text' in value:
-                item_str += value.get('text', 'N/A')
-            elif isinstance(value, list):
-                # Simple join for list items (e.g., skills)
-                try:
-                    item_str += ", ".join(str(s.get('name', s)) if isinstance(s, dict) else str(s) for s in value)
-                except:  # Fallback for unexpected list content
-                    item_str += str(value)
-            else:
-                item_str += str(value)
-            linkedin_items_str.append(item_str[:500])  # Truncate long values
-        formatted_str = "\n".join(linkedin_items_str)
-        return formatted_str if formatted_str else "No specific LinkedIn data items were formatted."
-    return "LinkedIn data is in an unexpected format."
+# --- Combined Summary Function (Modified) ---
+def summarise_linkedin_and_cv(api_key_gemini: str, cv_text: str | None, linkedin_data_str: str | None) -> str:
+    if not api_key_gemini:
+        return "Error: Gemini API key not provided."
 
-
-def summarise_linkedin_and_cv(
-        cv_data: str,
-        linkedin_profile_data: list | str,  # Output from your linkedin_scrapper
-        gemini_api_key: str
-) -> str:
-    cv_text_for_prompt = cv_data if cv_data and "Error reading PDF:" not in cv_data else "CV data not available or error during extraction."
-    linkedin_text_for_prompt = format_linkedin_data_for_prompt(linkedin_profile_data)
-
-    prompt = f"""
-    Please provide a concise professional summary based on the following data.
-    Highlight key skills, experiences, and overall professional profile.
-
-    CV Data:
-    ---
-    {cv_text_for_prompt}
-    ---
-
-    LinkedIn Data:
-    ---
-    {linkedin_text_for_prompt}
-    ---
-
-    Begin the summary:
-    """
     try:
-        genai.configure(api_key=gemini_api_key)
+        genai.configure(api_key=api_key_gemini)
         model = genai.GenerativeModel('gemini-1.5-flash-latest')  # Or 'gemini-pro'
+    except Exception as e:
+        return f"Error configuring Gemini: {e}"
+
+    prompt_parts = ["Please provide a concise summary of the candidate based on the following information."]
+    if cv_text and cv_text.strip():
+        prompt_parts.append(f"\n\n--- CV Data ---\n{cv_text}")
+    if linkedin_data_str and linkedin_data_str.strip() and linkedin_data_str != "Error":  # Check if it's not an error message
+        prompt_parts.append(f"\n\n--- LinkedIn Data ---\n{linkedin_data_str}")
+
+    if len(prompt_parts) == 1:  # Only the initial instruction, no data
+        return "No CV or LinkedIn data provided to summarize."
+
+    prompt = "".join(prompt_parts)
+
+    try:
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"Gemini API Error (Summarizer): {e}"
+        return f"Error generating summary with Gemini: {e}"
 
 
-def get_interview_response(
-        summary_context: str,
-        chat_history: list,  # List of {"role": "user/model", "content": "..."}
-        user_input: str,
-        gemini_api_key: str
-) -> str:
-    try:
-        genai.configure(api_key=gemini_api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash-latest')  # Or 'gemini-pro'
+# --- Initial Interview Questions ---
+INITIAL_QUESTIONS_TEXT = """
+Hey, welcome — I’m really glad you’re here.
+Before we dive into practice, I want to understand a bit about you — where you’re coming from, what you’re aiming for, and how I can be most helpful.
+Just a few questions, and then we’ll jump in.
 
-        # Construct the messages for the chat model
-        # The system prompt is implicitly part of the first user message structure for some models,
-        # or can be explicitly set if the API supports a system role.
-        # For Gemini, we build a history.
+Let’s start with your work — just so I get a sense of the world you operate in.
+1. What’s your current role, and how long have you been doing it?
+If it’s easier, feel free to link your LinkedIn or drop a resume — totally up to you. (This app already asks for these)
 
-        # Start with the system instruction and summary
-        # For Gemini, it's often better to include system instructions as part of the conversational turn.
-        # We'll prepend it to the history that Gemini sees.
+2. What’s got you preparing for interviews right now?
+ You don’t need a perfect answer — just what’s true for you.
+Some folks are job hunting after a layoff. Others are aiming for a big move — a promotion, a better offer, a dream company. And some just want to get better at telling their story.
+Which of those feels most like your situation?
 
-        system_prompt = f"""You are a friendly and professional AI interviewer.
-Your goal is to conduct an initial screening interview with the candidate.
-You have the following summary of the candidate's CV and LinkedIn profile:
---- CANDIDATE SUMMARY START ---
-{summary_context}
---- CANDIDATE SUMMARY END ---
+3. Just so I know how fast to go — where are you in your interview process?
+ Still early? Already in the loop? Just sharpening up?
+No pressure either way. This just helps me meet you where you are.
 
-Your previous conversation history with the candidate is:
+4. Any particular role or company you’ve got your eye on?
+ You can type something like “PM at Google” or “Marketing lead at a Series A startup.”
+ Or upload a job description if you’ve got one handy. (JD upload not implemented in this version)
+And if you're still figuring it out, that’s totally fine — we can start general and narrow in as you go.
+
+5. If we could fast-forward a few weeks — what do you wish felt easier?
+ Not just knowing the answers, but how you say them.
+A few things I help with — let me know what clicks:
+Making answers clearer and more structured
+Sounding more confident, less hesitant
+Getting to the point without rambling
+Speaking with polish and presence
+Managing nerves when it counts
+Cutting the filler words
+Actually being memorable — in a good way
+Pick what matters to you — we’ll build from there.
 """
-        # We will send the history as a list of `Content` objects (parts)
-        # For this, we convert our simple chat_history to the expected format if needed
 
-        full_prompt_history = []
+# --- Streamlit App ---
+st.set_page_config(layout="wide", page_title="AI Interview Prep Assistant")
 
-        # Initial instruction for the model (can be seen as a system-like prompt)
-        full_prompt_history.append({'role': 'user', 'parts': [
-            system_prompt + "Let's begin the interview. Please ask your first question, or respond to my previous statement."]})
-        full_prompt_history.append({'role': 'model', 'parts': [
-            "Okay, I understand. Based on your summary, let's start. Could you tell me a bit more about your experience with [mention a skill or experience from summary]?"]})  # Example initial bot turn
-
-        # Add actual chat history
-        for message in chat_history:
-            full_prompt_history.append({'role': message["role"], 'parts': [message["content"]]})
-
-        # Add the latest user input
-        full_prompt_history.append({'role': 'user', 'parts': [user_input]})
-
-        chat_session = model.start_chat(history=full_prompt_history[:-1])  # History up to the last user message
-        response = chat_session.send_message(full_prompt_history[-1]['parts'][0])  # Send the last user message
-
-        return response.text
-
-    except Exception as e:
-        return f"Gemini API Error (Chatbot): {e}"
-
-
-# --- Streamlit UI ---
-st.title("AI Interviewer Bot")
+st.title("🤖 AI Interview Prep Assistant")
+st.markdown("Get ready for your next interview with AI-powered practice!")
 
 # --- Initialize session state ---
-if 'summary' not in st.session_state:
-    st.session_state.summary = ""
-if 'cv_processed' not in st.session_state:  # To track if CV was processed
-    st.session_state.cv_processed = False
-if 'linkedin_processed' not in st.session_state:  # To track if LinkedIn was processed
-    st.session_state.linkedin_processed = False
-if "chat_messages" not in st.session_state:  # For chatbot
-    st.session_state.chat_messages = []
-if "summary_for_interview" not in st.session_state:  # Store the clean summary for chatbot
-    st.session_state.summary_for_interview = ""
+if "gemini_api_key" not in st.session_state:
+    st.session_state.gemini_api_key = ""
+if "linkedin_email" not in st.session_state:
+    st.session_state.linkedin_email = ""
+if "linkedin_password" not in st.session_state:
+    st.session_state.linkedin_password = ""
+if "linkedin_url" not in st.session_state:
+    st.session_state.linkedin_url = ""
+if "cv_text" not in st.session_state:
+    st.session_state.cv_text = None
+if "linkedin_data_str" not in st.session_state:
+    st.session_state.linkedin_data_str = None
+if "initial_answers_str" not in st.session_state:
+    st.session_state.initial_answers_str = ""
+if "combined_summary" not in st.session_state:
+    st.session_state.combined_summary = ""
+if "interview_started" not in st.session_state:
+    st.session_state.interview_started = False
+if "messages" not in st.session_state:  # For chatbot
+    st.session_state.messages = []
+if "gemini_chat" not in st.session_state:
+    st.session_state.gemini_chat = None
+if "data_processed" not in st.session_state:
+    st.session_state.data_processed = False
 
-# --- Sidebar for Inputs ---
-st.sidebar.header("🔑 Credentials & Profile")
-default_linkedin_email = os.environ.get("LINKEDIN_EMAIL", "")
-default_linkedin_password = os.environ.get("LINKEDIN_PASSWORD", "")
-default_gemini_key = os.environ.get("GEMINI_API_KEY", "")
+# --- Sidebar for Credentials ---
+with st.sidebar:
+    st.header("🔒 Credentials & Setup")
+    st.session_state.gemini_api_key = st.text_input("Gemini API Key", type="password",
+                                                    value=st.session_state.gemini_api_key)
+    st.session_state.linkedin_email = st.text_input("LinkedIn Email", value=st.session_state.linkedin_email)
+    st.session_state.linkedin_password = st.text_input("LinkedIn Password", type="password",
+                                                       value=st.session_state.linkedin_password)
 
-user_email_input = st.sidebar.text_input("LinkedIn Email", value=default_linkedin_email, key="li_email")
-user_password_input = st.sidebar.text_input("LinkedIn Password", type="password", value=default_linkedin_password,
-                                            key="li_pass")
-gemini_api_key_input = st.sidebar.text_input("Gemini API Key", type="password", value=default_gemini_key, key="gem_key")
-
-st.sidebar.header("📄 Inputs")
-uploaded_cv_file = st.sidebar.file_uploader("Upload CV (PDF)", type="pdf", key="cv_upload")
-linkedin_url_input = st.sidebar.text_input("LinkedIn Profile URL", key="li_url")
-
-if st.sidebar.button("🚀 Process Profile & Start Interview Prep", key="process_button"):
-    st.session_state.summary = ""  # Clear previous summary
-    st.session_state.summary_for_interview = ""
-    st.session_state.chat_messages = []  # Reset chat
-    st.session_state.cv_processed = False
-    st.session_state.linkedin_processed = False
-    error_messages = []
-
-    # Validate inputs
-    if not gemini_api_key_input:
-        st.sidebar.error("Gemini API Key is required.")
-    elif not uploaded_cv_file and not linkedin_url_input:
-        st.sidebar.error("Please upload a CV or provide a LinkedIn URL (or both).")
-    elif linkedin_url_input and (not user_email_input or not user_password_input):
-        st.sidebar.error("LinkedIn credentials are required if providing a LinkedIn URL.")
-    else:
-        cv_data_text = None
-        linkedin_profile_info = None
-
-        with st.spinner("Processing profile data..."):
-            # 1. Extract text from CV
-            if uploaded_cv_file:
-                cv_data_text = extract_text_from_cv(uploaded_cv_file)
-                st.session_state.cv_processed = True
-                if "Error reading PDF:" in cv_data_text:
-                    error_messages.append(f"CV Error: {cv_data_text}")
-                    cv_data_text = None  # Nullify on error for summary
-
-            # 2. Scrape LinkedIn profile
-            if linkedin_url_input:
-                linkedin_profile_info = linkedin_scrapper(user_email_input, user_password_input, linkedin_url_input)
-                st.session_state.linkedin_processed = True
-                if isinstance(linkedin_profile_info, str):  # Error from scrapper
-                    error_messages.append(f"LinkedIn Error: {linkedin_profile_info}")
-                    linkedin_profile_info = None  # Nullify on error for summary
-
-            # 3. Generate Summary if any data was processed
-            if cv_data_text or linkedin_profile_info:
-                summary_result = summarise_linkedin_and_cv(
-                    cv_data=cv_data_text if cv_data_text else "No CV data processed.",
-                    linkedin_profile_data=linkedin_profile_info if linkedin_profile_info else "No LinkedIn data processed.",
-                    gemini_api_key=gemini_api_key_input
-                )
-                st.session_state.summary = summary_result
-                if "Gemini API Error" not in summary_result:
-                    st.session_state.summary_for_interview = summary_result  # Store for chatbot
-                else:
-                    error_messages.append(summary_result)  # Add Gemini error to display
-            elif not st.session_state.cv_processed and not st.session_state.linkedin_processed:
-                st.session_state.summary = "No data (CV or LinkedIn) was provided for processing."
-
-            if error_messages:
-                for err in error_messages:
-                    st.error(err)
-            elif st.session_state.summary_for_interview:
-                st.success("Profile summary generated! The interview bot is ready below.")
-            elif not st.session_state.summary:  # If no summary and no specific errors, means no data
-                st.warning("No data was available to generate a summary.")
-
-# --- Display Summary (Optional, but good for user to see context) ---
-if st.session_state.summary:
-    st.subheader("📝 Your Profile Summary (Context for Interviewer)")
-    if "Error" in st.session_state.summary:
-        st.error(st.session_state.summary)
-    else:
-        st.markdown(st.session_state.summary)
     st.markdown("---")
+    st.info(
+        "Your LinkedIn credentials are used locally to fetch your profile data and are not stored long-term. However, be cautious with entering credentials.")
+    st.warning("Automated access to LinkedIn can sometimes lead to account issues. Use responsibly.")
 
-# --- Interview Chatbot Section ---
-if st.session_state.summary_for_interview and "Gemini API Error" not in st.session_state.summary_for_interview:
-    st.subheader("🎙️ AI Interviewer")
+# --- Main App Layout ---
+col1, col2 = st.columns(2)
 
-    # Display existing chat messages
-    for message in st.session_state.chat_messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+with col1:
+    st.subheader("Step 1: Provide Your Information")
+    st.session_state.linkedin_url = st.text_input("🔗 Your LinkedIn Profile URL", value=st.session_state.linkedin_url,
+                                                  placeholder="https://www.linkedin.com/in/yourname/")
+    uploaded_cv = st.file_uploader("📄 Upload Your CV/Resume (PDF only)", type="pdf")
 
-    # Chat input
-    if prompt := st.chat_input("Your response..."):
-        st.session_state.chat_messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    if uploaded_cv and not st.session_state.cv_text:  # Process if new CV uploaded and not already processed
+        with st.spinner("Extracting text from CV..."):
+            st.session_state.cv_text = extract_text_from_cv(uploaded_cv)
+            if st.session_state.cv_text and "Error reading PDF" not in st.session_state.cv_text:
+                st.success("CV text extracted!")
+            elif st.session_state.cv_text:
+                st.error(st.session_state.cv_text)  # Show the error from extraction
+            else:
+                st.error("Could not extract text from CV.")
 
-        with st.chat_message("assistant"):
-            message_placeholder = st.empty()
-            message_placeholder.markdown("Thinking...")
+    st.markdown("---")
+    st.subheader("Step 2: Answer Initial Questions")
+    st.markdown(INITIAL_QUESTIONS_TEXT.split("1.")[0])  # Intro text
 
-            # Prepare chat history for the API
-            api_chat_history = []
-            for msg in st.session_state.chat_messages[:-1]:  # Exclude the latest user message for history
-                api_chat_history.append({"role": msg["role"], "content": msg["content"]})
+    q_prompts = [
+        "1. What’s your current role, and how long have you been doing it?",
+        "2. What’s got you preparing for interviews right now? (e.g., job hunting, promotion, skill improvement)",
+        "3. Where are you in your interview process? (e.g., early, in the loop, sharpening up)",
+        "4. Any particular role or company you’ve got your eye on? (e.g., PM at Google, Marketing lead at Series A startup)",
+        "5. If we could fast-forward a few weeks — what do you wish felt easier? (e.g., clearer answers, more confident, less rambling, managing nerves)"
+    ]
 
-            assistant_response = get_interview_response(
-                summary_context=st.session_state.summary_for_interview,
-                chat_history=api_chat_history,  # Pass history up to previous turn
-                user_input=prompt,  # Pass current user input
-                gemini_api_key=gemini_api_key_input
-            )
-            message_placeholder.markdown(assistant_response)
-        st.session_state.chat_messages.append({"role": "assistant", "content": assistant_response})
-        # No st.rerun() needed here, chat_input and message display handle updates.
+    initial_answers = {}
+    if 'initial_answers_dict' not in st.session_state:
+        st.session_state.initial_answers_dict = {q: "" for q in q_prompts}
 
-elif st.session_state.cv_processed or st.session_state.linkedin_processed:  # If processing was attempted
-    if not st.session_state.summary_for_interview and st.session_state.summary and "Error" in st.session_state.summary:
-        st.warning("Could not prepare for interview due to errors in summary generation.")
-    elif not st.session_state.summary_for_interview:
-        st.info("Click 'Process Profile & Start Interview Prep' to begin.")
-else:
-    st.info("Upload your CV and/or LinkedIn profile, then click 'Process Profile & Start Interview Prep' to begin.")
+    for i, q_text in enumerate(q_prompts):
+        st.session_state.initial_answers_dict[q_text] = st.text_area(
+            q_text,
+            value=st.session_state.initial_answers_dict.get(q_text, ""),
+            height=100,
+            key=f"initial_q_{i}"
+        )
+
+    if st.button("🚀 Process My Info & Start Interview Prep", disabled=st.session_state.data_processed):
+        if not st.session_state.gemini_api_key:
+            st.error("Please enter your Gemini API Key in the sidebar.")
+        else:
+            with st.spinner("Processing your information... This may take a moment."):
+                # 1. Get LinkedIn Data
+                if st.session_state.linkedin_url and st.session_state.linkedin_email and st.session_state.linkedin_password:
+                    st.write("Fetching LinkedIn data...")
+                    status_msg, linkedin_result = linkedin_scrapper(
+                        st.session_state.linkedin_email,
+                        st.session_state.linkedin_password,
+                        st.session_state.linkedin_url
+                    )
+                    if status_msg == "Success":
+                        st.session_state.linkedin_data_str = str(linkedin_result)  # Convert list of tuples to string
+                        st.success("LinkedIn data fetched.")
+                    else:
+                        st.error(f"LinkedIn Error: {status_msg} - {linkedin_result}")
+                        st.session_state.linkedin_data_str = f"Error fetching LinkedIn data: {linkedin_result}"
+                else:
+                    st.warning("LinkedIn details not fully provided. Skipping LinkedIn data.")
+                    st.session_state.linkedin_data_str = "Not provided."
+
+                # 2. Format initial answers
+                answers_list = []
+                for q, a in st.session_state.initial_answers_dict.items():
+                    if a.strip():  # only include answered questions
+                        answers_list.append(f"Q: {q}\nA: {a.strip()}")
+                st.session_state.initial_answers_str = "\n\n".join(answers_list)
+                if not st.session_state.initial_answers_str:
+                    st.session_state.initial_answers_str = "User did not provide answers to initial questions."
+
+                # 3. Create Combined Summary
+                st.write("Generating combined summary using Gemini...")
+                st.session_state.combined_summary = summarise_linkedin_and_cv(
+                    st.session_state.gemini_api_key,
+                    st.session_state.cv_text,
+                    st.session_state.linkedin_data_str
+                )
+                if "Error" not in st.session_state.combined_summary:
+                    st.success("Summary generated!")
+                else:
+                    st.error(f"Summary Generation Failed: {st.session_state.combined_summary}")
+
+                # 4. Prepare for chat
+                if "Error" not in st.session_state.combined_summary:  # Only proceed if summary is good
+                    st.session_state.interview_started = True
+                    st.session_state.data_processed = True  # Prevent reprocessing
+                    st.session_state.messages = []  # Reset chat history
+
+                    # Initialize Gemini Chat
+                    try:
+                        genai.configure(api_key=st.session_state.gemini_api_key)
+                        model = genai.GenerativeModel('gemini-1.5-flash-latest')  # Or 'gemini-pro'
+
+                        # Construct comprehensive context for the chat model
+                        chat_context = f"""
+                        You are an expert interview coach. Your goal is to help the candidate practice for their interviews.
+                        Start the conversation by asking: "Tell me about yourself."
+                        Then, continue the interview based on their responses and the context provided below.
+                        Ask relevant behavioral questions, technical questions (if applicable based on their role), and situational questions.
+                        Provide constructive feedback on their answers if they ask for it or if you see clear areas for improvement.
+                        Keep your responses as an interviewer concise and focused on the interview flow.
+
+                        Here is some context about the candidate:
+
+                        --- Candidate Summary ---
+                        {st.session_state.combined_summary}
+
+                        --- Candidate's Answers to Initial Questions ---
+                        {st.session_state.initial_answers_str}
+
+                        --- Candidate's CV (if provided) ---
+                        {st.session_state.cv_text if st.session_state.cv_text else "CV not provided or text extraction failed."}
+
+                        --- Candidate's LinkedIn Data (if provided) ---
+                        {st.session_state.linkedin_data_str if st.session_state.linkedin_data_str != "Error fetching LinkedIn data" else "LinkedIn data not provided or fetch error."}
+
+                        Begin the interview now. Your first question should be: "Tell me about yourself."
+                        """
+                        st.session_state.gemini_chat = model.start_chat(history=[
+                            {"role": "user", "parts": [chat_context]},
+                            {"role": "model", "parts": [
+                                "Okay, I understand. Let's warm up with something simple, but important: Tell me about yourself."]}
+                        ])
+                        st.session_state.messages.append({"role": "assistant",
+                                                          "content": "Okay, I understand. Let's warm up with something simple, but important: Tell me about yourself."})
+                        st.rerun()  # Rerun to update the UI for the chat
+                    except Exception as e:
+                        st.error(f"Error initializing Gemini chat: {e}")
+                        st.session_state.interview_started = False
+                        st.session_state.data_processed = False  # Allow reprocessing
+                else:
+                    st.error("Could not start interview due to errors in data processing.")
+                    st.session_state.data_processed = False  # Allow reprocessing
+
+if st.session_state.data_processed and st.button("🔄 Reset and Start Over"):
+    # Clear relevant session state variables to allow starting over
+    for key in ["cv_text", "linkedin_data_str", "initial_answers_str",
+                "combined_summary", "interview_started", "messages",
+                "gemini_chat", "data_processed", "initial_answers_dict"]:
+        if key in st.session_state:
+            del st.session_state[key]
+    st.rerun()
+
+with col2:
+    st.subheader("Step 3: Interview Practice")
+    if not st.session_state.interview_started:
+        st.info("Complete Step 1 & 2 and click 'Process My Info' to begin the interview.")
+
+    if st.session_state.combined_summary and "Error" not in st.session_state.combined_summary:
+        with st.expander("View Candidate Summary & Initial Answers", expanded=False):
+            st.markdown("**Generated Candidate Summary:**")
+            st.markdown(st.session_state.combined_summary)
+            st.markdown("**Initial Question Answers:**")
+            st.markdown(st.session_state.initial_answers_str.replace("\n", "\n\n"))  # Add more space for readability
+            if st.session_state.cv_text and "Error" not in st.session_state.cv_text:
+                st.markdown("**CV Text:**")
+                st.text_area("CV Content", st.session_state.cv_text, height=150, disabled=True)
+            if st.session_state.linkedin_data_str and "Error" not in st.session_state.linkedin_data_str and st.session_state.linkedin_data_str != "Not provided.":
+                st.markdown("**LinkedIn Data:**")
+                st.text_area("LinkedIn Content", st.session_state.linkedin_data_str, height=150, disabled=True)
+
+    if st.session_state.interview_started and st.session_state.gemini_chat:
+        # Display chat messages
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+        # Chat input
+        if prompt := st.chat_input("Your answer..."):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            with st.chat_message("assistant"):
+                message_placeholder = st.empty()
+                full_response = ""
+                try:
+                    with st.spinner("Interviewer thinking..."):
+                        response_stream = st.session_state.gemini_chat.send_message(prompt, stream=True)
+                        for chunk in response_stream:
+                            full_response += chunk.text
+                            message_placeholder.markdown(full_response + "▌")
+                        message_placeholder.markdown(full_response)
+                    st.session_state.messages.append({"role": "assistant", "content": full_response})
+                except Exception as e:
+                    error_message = f"An error occurred with the Gemini API: {e}"
+                    st.error(error_message)
+                    st.session_state.messages.append({"role": "assistant", "content": error_message})
+                    # Optionally, try to re-initialize chat or offer a retry mechanism
+                    st.session_state.interview_started = False  # Stop interview on error
+                    st.warning(
+                        "Interview stopped due to an API error. Please check your API key and try processing again.")
+
+    elif st.session_state.data_processed and not st.session_state.interview_started:
+        st.warning("Interview could not start. Check for error messages above and try processing your info again.")
